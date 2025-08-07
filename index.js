@@ -23,9 +23,16 @@ app.get('/', (req, res) => {
 // Cria empresa/cliente + usuário principal
 // ===============================
 app.post('/onboarding', async (req, res) => {
-  const { nome_razao, email, password, nome_usuario } = req.body;
-  if (!nome_razao || !email || !password) {
+  const {
+    tipo_cliente, nome_razao, email, password,
+    telefone, cnpj, nome_fantasia, cpf
+  } = req.body;
+
+  if (!tipo_cliente || !nome_razao || !email || !password) {
     return res.status(400).json({ error: 'Campos obrigatórios ausentes' });
+  }
+  if (tipo_cliente !== 'pf' && tipo_cliente !== 'pj') {
+    return res.status(400).json({ error: 'Tipo de cliente inválido' });
   }
 
   // Cria usuário no Supabase Auth
@@ -36,10 +43,10 @@ app.post('/onboarding', async (req, res) => {
   });
   if (authError) return res.status(400).json({ error: authError.message });
 
-  // Cria cliente/empresa
+  // Cria cliente
   const { data: clienteData, error: clienteError } = await supabase
     .from('clientes')
-    .insert([{ nome_razao, email }])
+    .insert([{ nome_razao, email, tipo_cliente, telefone, cnpj, cpf }])
     .select()
     .single();
   if (clienteError) return res.status(400).json({ error: clienteError.message });
@@ -50,7 +57,7 @@ app.post('/onboarding', async (req, res) => {
     .from('usuarios')
     .insert([{
       id_cliente: clienteData.id,
-      nome: nome_usuario || nome_razao,
+      nome: nome_razao,
       email,
       senha_hash,
       role: 'admin'
@@ -59,12 +66,51 @@ app.post('/onboarding', async (req, res) => {
     .single();
   if (usuarioError) return res.status(400).json({ error: usuarioError.message });
 
+  let empresaData = null;
+  let contatoData = null;
+
+  if (tipo_cliente === 'pj') {
+    // Cria empresa vinculada ao cliente
+    const { data, error } = await supabase
+      .from('empresas')
+      .insert([{
+        id_cliente: clienteData.id,
+        nome: nome_fantasia || nome_razao,
+        cnpj: cnpj || null,
+        telefone: telefone || null
+      }])
+      .select()
+      .single();
+    if (error) return res.status(400).json({ error: error.message });
+    empresaData = data;
+  }
+
+  if (tipo_cliente === 'pf') {
+    // Cria contato vinculado ao cliente
+    const { data, error } = await supabase
+      .from('contatos')
+      .insert([{
+        id_cliente: clienteData.id,
+        nome: nome_razao,
+        telefone: telefone || null,
+        email: email,
+        cpf: cpf || null
+      }])
+      .select()
+      .single();
+    if (error) return res.status(400).json({ error: error.message });
+    contatoData = data;
+  }
+
   return res.json({
     user: userData,
     cliente: clienteData,
-    usuario: usuarioData
+    usuario: usuarioData,
+    empresa: empresaData,
+    contato: contatoData
   });
 });
+
 
 // ===============================
 // Rota de cadastro de usuário adicional
