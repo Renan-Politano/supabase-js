@@ -24,23 +24,43 @@ app.get('/', (req, res) => {
 app.post('/onboarding', async (req, res) => {
   try {
     const {
-      client_type,        // 'individual' or 'company'
-      full_name,
-      document,           // CPF or CNPJ (only numbers)
+      client_type,        // deve ser "company"
+      full_name,          // nome do responsável
+      company_name,       // razão social
+      document,           // CNPJ só números
       email,
       password,
-      phone,
-      company_name        // (optional, only for company)
+      phone
     } = req.body;
 
-    if (!client_type || !full_name || !document || !email || !password || !phone) {
+    // Checa se tudo está preenchido
+    if (
+      !client_type || client_type !== "company" ||
+      !full_name || !company_name ||
+      !document || !email || !password || !phone
+    ) {
       return res.status(400).json({ error: "Missing required fields." });
     }
-    if (client_type !== "individual" && client_type !== "company") {
-      return res.status(400).json({ error: "Invalid client_type. Must be 'individual' or 'company'." });
-    }
 
-    // 1. Create user in Supabase Auth (for secure login)
+    // 1. Criar cliente
+    const { data: clientData, error: clientError } = await supabase
+      .from('clients')
+      .insert([{
+        full_name,                   // nome do responsável (ex: Maria Souza)
+        company_name,                // razão social (ex: XPTO LTDA)
+        document,                    // CNPJ
+        email,                       // email principal
+        phone,
+        client_type: "company"
+      }])
+      .select()
+      .single();
+    if (clientError) return res.status(400).json({ error: clientError.message });
+    const client_id = clientData.id;
+
+    // 2. Criar usuário (responsável principal)
+    const password_hash = await bcrypt.hash(password, 10);
+    // Auth
     const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
       email,
       password,
@@ -48,29 +68,11 @@ app.post('/onboarding', async (req, res) => {
     });
     if (authError) return res.status(400).json({ error: authError.message });
 
-    // 2. Create client
-    const { data: clientData, error: clientError } = await supabase
-      .from('clients')
-      .insert([{
-        full_name,
-        company_name: client_type === 'company' ? company_name : null,
-        document,
-        email,
-        phone,
-        client_type
-      }])
-      .select()
-      .single();
-    if (clientError) return res.status(400).json({ error: clientError.message });
-    const client_id = clientData.id;
-
-    // 3. Create user in 'users' (with id_auth)
-    const password_hash = await bcrypt.hash(password, 10);
     const { data: userData, error: userError } = await supabase
       .from('users')
       .insert([{
         client_id: client_id,
-        full_name: full_name,
+        full_name: full_name,    // nome do responsável
         email: email,
         password_hash: password_hash,
         id_auth: authUser.user.id
@@ -80,29 +82,43 @@ app.post('/onboarding', async (req, res) => {
     if (userError) return res.status(400).json({ error: userError.message });
     const user_id = userData.id;
 
-    // 4. Create contact or company
-    if (client_type === "individual") {
-      const { error: contactError } = await supabase
-        .from('contacts')
-        .insert([{
-          client_id: client_id,
-          full_name: full_name,
-          phone: phone,
-          email: email,
-          responsible_id: user_id
-        }]);
-      if (contactError) return res.status(400).json({ error: contactError.message });
-    } else if (client_type === "company") {
-      const { error: companyError } = await supabase
-        .from('companies')
-        .insert([{
-          client_id: client_id,
-          company_name: company_name || full_name,
-          document: document,
-          responsible_id: user_id
-        }]);
-      if (companyError) return res.status(400).json({ error: companyError.message });
-    }
+    // 3. Criar contato (do responsável)
+    const { data: contactData, error: contactError } = await supabase
+      .from('contacts')
+      .insert([{
+        client_id: client_id,
+        full_name: full_name,   // nome do responsável
+        phone: phone,
+        email: email,
+        responsible_id: user_id
+      }])
+      .select()
+      .single();
+    if (contactError) return res.status(400).json({ error: contactError.message });
+    const contact_id = contactData.id;
+
+    // 4. Criar empresa
+    const { data: companyData, error: companyError } = await supabase
+      .from('companies')
+      .insert([{
+        client_id: client_id,
+        name: company_name,     // razão social
+        cnpj: document,
+        responsible_id: user_id
+      }])
+      .select()
+      .single();
+    if (companyError) return res.status(400).json({ error: companyError.message });
+    const company_id = companyData.id;
+
+    // 5. Vincular contato à empresa (contact_company)
+    const { error: linkError } = await supabase
+      .from('contact_company')
+      .insert([{
+        contact_id: contact_id,
+        company_id: company_id
+      }]);
+    if (linkError) return res.status(400).json({ error: linkError.message });
 
     return res.status(201).json({ message: "Registration successful! Please check your email for confirmation." });
 
