@@ -50,29 +50,30 @@ app.post('/onboarding', async (req, res) => {
 
     // 2. Create client
     const { data: clientData, error: clientError } = await supabase
-      .from('clientes')
+      .from('clients')
       .insert([{
-        nome_razao: full_name,
-        documento: document,
+        full_name,
+        company_name: client_type === 'company' ? company_name : null,
+        document,
         email,
-        telefone: phone,
-        tipo_cliente: client_type === 'individual' ? 'pessoa_fisica' : 'pessoa_juridica'
+        phone,
+        client_type
       }])
       .select()
       .single();
     if (clientError) return res.status(400).json({ error: clientError.message });
     const client_id = clientData.id;
 
-    // 3. Create user in 'usuarios' (with id_auth)
+    // 3. Create user in 'users' (with id_auth)
     const password_hash = await bcrypt.hash(password, 10);
     const { data: userData, error: userError } = await supabase
-      .from('usuarios')
+      .from('users')
       .insert([{
-        id_cliente: client_id,
-        nome: full_name,
-        email,
-        senha_hash: password_hash,
-        id_auth: authUser.user.id // important for future Auth sync!
+        client_id: client_id,
+        full_name: full_name,
+        email: email,
+        password_hash: password_hash,
+        id_auth: authUser.user.id
       }])
       .select()
       .single();
@@ -82,23 +83,23 @@ app.post('/onboarding', async (req, res) => {
     // 4. Create contact or company
     if (client_type === "individual") {
       const { error: contactError } = await supabase
-        .from('contatos')
+        .from('contacts')
         .insert([{
-          id_cliente: client_id,
-          nome: full_name,
-          telefone: phone,
-          email,
-          id_responsavel: user_id
+          client_id: client_id,
+          full_name: full_name,
+          phone: phone,
+          email: email,
+          responsible_id: user_id
         }]);
       if (contactError) return res.status(400).json({ error: contactError.message });
     } else if (client_type === "company") {
       const { error: companyError } = await supabase
-        .from('empresas')
+        .from('companies')
         .insert([{
-          id_cliente: client_id,
-          nome: company_name || full_name,
-          cnpj: document,
-          id_responsavel: user_id
+          client_id: client_id,
+          company_name: company_name || full_name,
+          document: document,
+          responsible_id: user_id
         }]);
       if (companyError) return res.status(400).json({ error: companyError.message });
     }
@@ -126,9 +127,9 @@ app.post('/login', async (req, res) => {
   });
   if (error) return res.status(401).json({ error: 'Invalid credentials.' });
 
-  // 2. Find user in 'usuarios' by email (for roles, client_id etc)
+  // 2. Find user in 'users' by email (for roles, client_id etc)
   const { data: userData, error: userError } = await supabase
-    .from('usuarios')
+    .from('users')
     .select('*')
     .eq('email', email)
     .single();
@@ -142,10 +143,6 @@ app.post('/login', async (req, res) => {
     user: userData
   });
 });
-
-// ===============================
-// (Optional) Add your "add user" and other routes here as needed
-// ===============================
 
 // Start server
 const PORT = process.env.PORT || 4000;
