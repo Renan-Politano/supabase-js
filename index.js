@@ -13,156 +13,142 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// Teste
+// Health check route
 app.get('/', (req, res) => {
-  res.send('API ChatLead funcionando!');
+  res.send('ChatLead API running!');
 });
 
 // ===============================
-// Rota de cadastro inicial (onboarding)
-// Cria empresa/cliente + usuário principal
+// Onboarding (Registration)
 // ===============================
 app.post('/onboarding', async (req, res) => {
-  const { tipo_cliente, nome_razao, documento, email, telefone, senha } = req.body;
-  if (!tipo_cliente || !nome_razao || !documento || !email || !telefone || !senha) {
-    return res.status(400).json({ error: "Campos obrigatórios faltando." });
-  }
-
-  // 1. Cadastrar cliente
-  const { data: clienteData, error: clienteError } = await supabase
-    .from('clientes')
-    .insert([{
-      nome_razao,
-      documento,
+  try {
+    const {
+      client_type,        // 'individual' or 'company'
+      full_name,
+      document,           // CPF or CNPJ (only numbers)
       email,
-      telefone,
-      tipo_cliente
-    }])
-    .select()
-    .single();
+      password,
+      phone,
+      company_name        // (optional, only for company)
+    } = req.body;
 
-  if (clienteError) {
-    return res.status(400).json({ error: clienteError.message });
-  }
-  const id_cliente = clienteData.id;
+    if (!client_type || !full_name || !document || !email || !password || !phone) {
+      return res.status(400).json({ error: "Missing required fields." });
+    }
+    if (client_type !== "individual" && client_type !== "company") {
+      return res.status(400).json({ error: "Invalid client_type. Must be 'individual' or 'company'." });
+    }
 
-  // 2. Cadastrar usuário principal
-  const senha_hash = await bcrypt.hash(senha, 10);
-  const { data: usuarioData, error: usuarioError } = await supabase
-    .from('usuarios')
-    .insert([{
-      id_cliente,
-      nome: nome_razao,
+    // 1. Create user in Supabase Auth (for secure login)
+    const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
       email,
-      senha_hash
-    }])
-    .select()
-    .single();
+      password,
+      email_confirm: true
+    });
+    if (authError) return res.status(400).json({ error: authError.message });
 
-  if (usuarioError) {
-    return res.status(400).json({ error: usuarioError.message });
-  }
-  const id_usuario = usuarioData.id;
-
-  // 3. Cadastro de acordo com o tipo
-  if (tipo_cliente === "pessoa_fisica") {
-    // Cadastro em contatos
-    const { error: contatoError } = await supabase
-      .from('contatos')
+    // 2. Create client
+    const { data: clientData, error: clientError } = await supabase
+      .from('clientes')
       .insert([{
-        id_cliente,
-        nome: nome_razao,
-        telefone,
+        nome_razao: full_name,
+        documento: document,
         email,
-        id_responsavel: id_usuario
-      }]);
-    if (contatoError) {
-      return res.status(400).json({ error: contatoError.message });
-    }
-  } else if (tipo_cliente === "pessoa_juridica") {
-    // Cadastro em empresas
-    const { error: empresaError } = await supabase
-      .from('empresas')
+        telefone: phone,
+        tipo_cliente: client_type === 'individual' ? 'pessoa_fisica' : 'pessoa_juridica'
+      }])
+      .select()
+      .single();
+    if (clientError) return res.status(400).json({ error: clientError.message });
+    const client_id = clientData.id;
+
+    // 3. Create user in 'usuarios' (with id_auth)
+    const password_hash = await bcrypt.hash(password, 10);
+    const { data: userData, error: userError } = await supabase
+      .from('usuarios')
       .insert([{
-        id_cliente,
-        nome: nome_razao,
-        cnpj: documento,
-        id_responsavel: id_usuario
-      }]);
-    if (empresaError) {
-      return res.status(400).json({ error: empresaError.message });
+        id_cliente: client_id,
+        nome: full_name,
+        email,
+        senha_hash: password_hash,
+        id_auth: authUser.user.id // important for future Auth sync!
+      }])
+      .select()
+      .single();
+    if (userError) return res.status(400).json({ error: userError.message });
+    const user_id = userData.id;
+
+    // 4. Create contact or company
+    if (client_type === "individual") {
+      const { error: contactError } = await supabase
+        .from('contatos')
+        .insert([{
+          id_cliente: client_id,
+          nome: full_name,
+          telefone: phone,
+          email,
+          id_responsavel: user_id
+        }]);
+      if (contactError) return res.status(400).json({ error: contactError.message });
+    } else if (client_type === "company") {
+      const { error: companyError } = await supabase
+        .from('empresas')
+        .insert([{
+          id_cliente: client_id,
+          nome: company_name || full_name,
+          cnpj: document,
+          id_responsavel: user_id
+        }]);
+      if (companyError) return res.status(400).json({ error: companyError.message });
     }
-  }
 
-  return res.status(201).json({ message: "Cadastro realizado com sucesso!" });
+    return res.status(201).json({ message: "Registration successful! Please check your email for confirmation." });
+
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Internal server error." });
+  }
 });
 
 // ===============================
-// Rota de cadastro de usuário adicional
-// Cadastra usuário dentro de um cliente já existente
+// User login (via Supabase Auth)
 // ===============================
-app.post('/cadastro', async (req, res) => {
-  const { id_cliente, nome, email, password, role } = req.body;
-  if (!id_cliente || !nome || !email || !password) {
-    return res.status(400).json({ error: 'Campos obrigatórios ausentes' });
-  }
-
-  // Cria usuário no Supabase Auth
-  const { data: userData, error: authError } = await supabase.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true
-  });
-  if (authError) return res.status(400).json({ error: authError.message });
-
-  // Cria usuário no banco (vinculado ao cliente)
-  const senha_hash = await bcrypt.hash(password, 10);
-  const { data: usuarioData, error: usuarioError } = await supabase
-    .from('usuarios')
-    .insert([{
-      id_cliente,
-      nome,
-      email,
-      senha_hash,
-      role: role || 'colaborador'
-    }])
-    .select()
-    .single();
-  if (usuarioError) return res.status(400).json({ error: usuarioError.message });
-
-  return res.json({
-    user: userData,
-    usuario: usuarioData
-  });
-});
-
-// =====================
-// Rota de login
-// =====================
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password)
-    return res.status(400).json({ error: 'Email e senha obrigatórios' });
+    return res.status(400).json({ error: 'Email and password are required.' });
 
-  // Busca usuário em 'usuarios'
-  const { data: usuarioData, error } = await supabase
+  // 1. Authenticate via Supabase Auth
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password
+  });
+  if (error) return res.status(401).json({ error: 'Invalid credentials.' });
+
+  // 2. Find user in 'usuarios' by email (for roles, client_id etc)
+  const { data: userData, error: userError } = await supabase
     .from('usuarios')
     .select('*')
     .eq('email', email)
     .single();
 
-  if (error || !usuarioData)
-    return res.status(400).json({ error: 'Usuário não encontrado' });
+  if (userError || !userData)
+    return res.status(401).json({ error: 'User not found in database.' });
 
-  const senhaOk = await bcrypt.compare(password, usuarioData.senha_hash);
-  if (!senhaOk)
-    return res.status(401).json({ error: 'Senha inválida' });
-
-  return res.json({ usuario: usuarioData });
+  // 3. Return token and user data
+  return res.json({
+    token: data.session.access_token,
+    user: userData
+  });
 });
 
-// Porta do Railway ou local
+// ===============================
+// (Optional) Add your "add user" and other routes here as needed
+// ===============================
+
+// Start server
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Backend rodando na porta ${PORT}`);
+  console.log(`ChatLead API running on port ${PORT}`);
 });
