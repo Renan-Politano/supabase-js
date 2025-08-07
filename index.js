@@ -22,42 +22,76 @@ app.get('/', (req, res) => {
 // Rota de cadastro inicial (onboarding)
 // Cria empresa/cliente + usuário principal
 // ===============================
-// Exemplo do endpoint de cadastro
 app.post('/onboarding', async (req, res) => {
   const { tipo_cliente, nome_razao, documento, email, telefone, senha } = req.body;
   if (!tipo_cliente || !nome_razao || !documento || !email || !telefone || !senha) {
     return res.status(400).json({ error: "Campos obrigatórios faltando." });
   }
 
-  // Cadastrar cliente
-  const cliente = await db.query(`
-    INSERT INTO clientes (nome_razao, documento, email, telefone, tipo_cliente)
-    VALUES ($1, $2, $3, $4, $5)
-    RETURNING id
-  `, [nome_razao, documento, email, telefone, tipo_cliente]);
-  const id_cliente = cliente.rows[0].id;
+  // 1. Cadastrar cliente
+  const { data: clienteData, error: clienteError } = await supabase
+    .from('clientes')
+    .insert([{
+      nome_razao,
+      documento,
+      email,
+      telefone,
+      tipo_cliente
+    }])
+    .select()
+    .single();
 
-  // Cadastrar usuário
+  if (clienteError) {
+    return res.status(400).json({ error: clienteError.message });
+  }
+  const id_cliente = clienteData.id;
+
+  // 2. Cadastrar usuário principal
   const senha_hash = await bcrypt.hash(senha, 10);
-  const usuario = await db.query(`
-    INSERT INTO usuarios (id_cliente, nome, email, senha_hash)
-    VALUES ($1, $2, $3, $4)
-    RETURNING id
-  `, [id_cliente, nome_razao, email, senha_hash]);
-  const id_usuario = usuario.rows[0].id;
+  const { data: usuarioData, error: usuarioError } = await supabase
+    .from('usuarios')
+    .insert([{
+      id_cliente,
+      nome: nome_razao,
+      email,
+      senha_hash
+    }])
+    .select()
+    .single();
 
+  if (usuarioError) {
+    return res.status(400).json({ error: usuarioError.message });
+  }
+  const id_usuario = usuarioData.id;
+
+  // 3. Cadastro de acordo com o tipo
   if (tipo_cliente === "pessoa_fisica") {
     // Cadastro em contatos
-    await db.query(`
-      INSERT INTO contatos (id_cliente, nome, telefone, email, id_responsavel)
-      VALUES ($1, $2, $3, $4, $5)
-    `, [id_cliente, nome_razao, telefone, email, id_usuario]);
+    const { error: contatoError } = await supabase
+      .from('contatos')
+      .insert([{
+        id_cliente,
+        nome: nome_razao,
+        telefone,
+        email,
+        id_responsavel: id_usuario
+      }]);
+    if (contatoError) {
+      return res.status(400).json({ error: contatoError.message });
+    }
   } else if (tipo_cliente === "pessoa_juridica") {
     // Cadastro em empresas
-    await db.query(`
-      INSERT INTO empresas (id_cliente, nome, cnpj, id_responsavel)
-      VALUES ($1, $2, $3, $4)
-    `, [id_cliente, nome_razao, documento, id_usuario]);
+    const { error: empresaError } = await supabase
+      .from('empresas')
+      .insert([{
+        id_cliente,
+        nome: nome_razao,
+        cnpj: documento,
+        id_responsavel: id_usuario
+      }]);
+    if (empresaError) {
+      return res.status(400).json({ error: empresaError.message });
+    }
   }
 
   return res.status(201).json({ message: "Cadastro realizado com sucesso!" });
