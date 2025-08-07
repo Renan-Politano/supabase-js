@@ -22,95 +22,46 @@ app.get('/', (req, res) => {
 // Rota de cadastro inicial (onboarding)
 // Cria empresa/cliente + usuário principal
 // ===============================
+// Exemplo do endpoint de cadastro
 app.post('/onboarding', async (req, res) => {
-  const {
-    tipo_cliente, nome_razao, email, password,
-    telefone, cnpj, nome_fantasia, cpf
-  } = req.body;
-
-  if (!tipo_cliente || !nome_razao || !email || !password) {
-    return res.status(400).json({ error: 'Campos obrigatórios ausentes' });
-  }
-  if (tipo_cliente !== 'pf' && tipo_cliente !== 'pj') {
-    return res.status(400).json({ error: 'Tipo de cliente inválido' });
+  const { tipo_cliente, nome_razao, documento, email, telefone, senha } = req.body;
+  if (!tipo_cliente || !nome_razao || !documento || !email || !telefone || !senha) {
+    return res.status(400).json({ error: "Campos obrigatórios faltando." });
   }
 
-  // Cria usuário no Supabase Auth
-  const { data: userData, error: authError } = await supabase.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true
-  });
-  if (authError) return res.status(400).json({ error: authError.message });
+  // Cadastrar cliente
+  const cliente = await db.query(`
+    INSERT INTO clientes (nome_razao, documento, email, telefone, tipo_cliente)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING id
+  `, [nome_razao, documento, email, telefone, tipo_cliente]);
+  const id_cliente = cliente.rows[0].id;
 
-  // Cria cliente
-  const { data: clienteData, error: clienteError } = await supabase
-    .from('clientes')
-    .insert([{ nome_razao, email, tipo_cliente, telefone, cnpj, cpf }])
-    .select()
-    .single();
-  if (clienteError) return res.status(400).json({ error: clienteError.message });
+  // Cadastrar usuário
+  const senha_hash = await bcrypt.hash(senha, 10);
+  const usuario = await db.query(`
+    INSERT INTO usuarios (id_cliente, nome, email, senha_hash)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id
+  `, [id_cliente, nome_razao, email, senha_hash]);
+  const id_usuario = usuario.rows[0].id;
 
-  // Cria usuário principal
-  const senha_hash = await bcrypt.hash(password, 10);
-  const { data: usuarioData, error: usuarioError } = await supabase
-    .from('usuarios')
-    .insert([{
-      id_cliente: clienteData.id,
-      nome: nome_razao,
-      email,
-      senha_hash,
-      role: 'admin'
-    }])
-    .select()
-    .single();
-  if (usuarioError) return res.status(400).json({ error: usuarioError.message });
-
-  let empresaData = null;
-  let contatoData = null;
-
-  if (tipo_cliente === 'pj') {
-    // Cria empresa vinculada ao cliente
-    const { data, error } = await supabase
-      .from('empresas')
-      .insert([{
-        id_cliente: clienteData.id,
-        nome: nome_fantasia || nome_razao,
-        cnpj: cnpj || null,
-        telefone: telefone || null
-      }])
-      .select()
-      .single();
-    if (error) return res.status(400).json({ error: error.message });
-    empresaData = data;
+  if (tipo_cliente === "pessoa_fisica") {
+    // Cadastro em contatos
+    await db.query(`
+      INSERT INTO contatos (id_cliente, nome, telefone, email, id_responsavel)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [id_cliente, nome_razao, telefone, email, id_usuario]);
+  } else if (tipo_cliente === "pessoa_juridica") {
+    // Cadastro em empresas
+    await db.query(`
+      INSERT INTO empresas (id_cliente, nome, cnpj, id_responsavel)
+      VALUES ($1, $2, $3, $4)
+    `, [id_cliente, nome_razao, documento, id_usuario]);
   }
 
-  if (tipo_cliente === 'pf') {
-    // Cria contato vinculado ao cliente
-    const { data, error } = await supabase
-      .from('contatos')
-      .insert([{
-        id_cliente: clienteData.id,
-        nome: nome_razao,
-        telefone: telefone || null,
-        email: email,
-        cpf: cpf || null
-      }])
-      .select()
-      .single();
-    if (error) return res.status(400).json({ error: error.message });
-    contatoData = data;
-  }
-
-  return res.json({
-    user: userData,
-    cliente: clienteData,
-    usuario: usuarioData,
-    empresa: empresaData,
-    contato: contatoData
-  });
+  return res.status(201).json({ message: "Cadastro realizado com sucesso!" });
 });
-
 
 // ===============================
 // Rota de cadastro de usuário adicional
