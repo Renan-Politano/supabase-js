@@ -22,6 +22,8 @@ app.get('/', (req, res) => {
 // Onboarding (Registration)
 // ===============================
 app.post('/onboarding', async (req, res) => {
+  let authUserId = null;
+
   try {
     const {
       client_type,        // 'individual' | 'company'
@@ -49,9 +51,26 @@ app.post('/onboarding', async (req, res) => {
     // 2) Normalização
     const onlyDigits = (s) => (s || '').toString().replace(/\D+/g, '');
     const normalizedDocument = onlyDigits(document);
-    const normalizedPhone = phone.replace(/\s+/g, '').replace(/[\(\)\-\.]/g, ''); // garanta E.164 do lado do front se puder
+    const normalizedPhone = (phone || '')
+      .replace(/\s+/g, '')
+      .replace(/[\(\)\-\.]/g, ''); // ideal: já vir E.164 do front (+5511999999999)
 
-    // 3) Criar CLIENT primeiro (usa service key no backend, então RLS não bloqueia)
+    // 3) signUp — envia e-mail automaticamente (se "Confirm email" estiver ON no Supabase)
+    const { data: suData, error: suErr } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { full_name }, // user_metadata
+      }
+    });
+    if (suErr) return res.status(400).json({ error: suErr.message });
+
+    authUserId = suData?.user?.id;
+    if (!authUserId) {
+      return res.status(400).json({ error: 'Auth user not returned by signUp.' });
+    }
+
+    // 4) Criar CLIENT (usa service key no backend, então RLS não bloqueia)
     const { data: clientData, error: clientError } = await supabase
       .from('clients')
       .insert([{
@@ -64,42 +83,51 @@ app.post('/onboarding', async (req, res) => {
       }])
       .select()
       .single();
-    if (clientError) return res.status(400).json({ error: clientError.message });
+
+    if (clientError) {
+      // rollback do usuário no Auth para não sobrar órfão
+      try { await supabase.auth.admin.deleteUser(authUserId); } catch (_) {}
+      return res.status(400).json({ error: clientError.message });
+    }
 
     const client_id = clientData.id;
 
-    // 4) Criar usuário no Auth JÁ com app_metadata.client_id
-    const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
-      email,
-      password,
-      // Se quiser obrigar confirmação por e-mail, deixe false e convide abaixo:
-      email_confirm: false,
-      app_metadata: { client_id },
-      user_metadata: { full_name }
+    // 5) Setar app_metadata.client_id DEPOIS do signUp
+    const { error: updErr } = await supabase.auth.admin.updateUserById(authUserId, {
+      app_metadata: { client_id }
     });
-    if (authError) return res.status(400).json({ error: authError.message });
+    if (updErr) {
+      // rollback: apaga user auth e client criado
+      try { await supabase.auth.admin.deleteUser(authUserId); } catch (_) {}
+      try { await supabase.from('clients').delete().eq('id', client_id); } catch (_) {}
+      return res.status(400).json({ error: updErr.message });
+    }
 
-    // (Opcional) Enviar e-mail de convite/confirm.
-    // await supabase.auth.admin.inviteUserByEmail(email, { data: { client_id } });
-
-    // 5) Criar espelho em USERS
+    // 6) Criar espelho em USERS
+    // OBS de segurança: evitar armazenar password_hash próprio; o Supabase já guarda a senha.
+    // Mantive para não quebrar o escopo. Se não quiser, remova as 3 linhas de hash + field na insert.
     const password_hash = await bcrypt.hash(password, 10);
     const { data: userData, error: userError } = await supabase
       .from('users')
       .insert([{
         client_id,
-        id_auth: authUser.user.id,
+        id_auth: authUserId,
         full_name,
         email,
         password_hash
       }])
       .select()
       .single();
-    if (userError) return res.status(400).json({ error: userError.message });
+    if (userError) {
+      // rollback total
+      try { await supabase.auth.admin.deleteUser(authUserId); } catch (_) {}
+      try { await supabase.from('clients').delete().eq('id', client_id); } catch (_) {}
+      return res.status(400).json({ error: userError.message });
+    }
 
     const user_id = userData.id;
 
-    // 6) Dados de negócio por tipo
+    // 7) Dados de negócio por tipo
     if (client_type === 'individual') {
       const { error: contactError } = await supabase
         .from('contacts')
@@ -110,10 +138,17 @@ app.post('/onboarding', async (req, res) => {
           email,
           responsible_id: user_id
         }]);
-      if (contactError) return res.status(400).json({ error: contactError.message });
+
+      if (contactError) {
+        // rollback total
+        try { await supabase.auth.admin.deleteUser(authUserId); } catch (_) {}
+        try { await supabase.from('users').delete().eq('id', user_id); } catch (_) {}
+        try { await supabase.from('clients').delete().eq('id', client_id); } catch (_) {}
+        return res.status(400).json({ error: contactError.message });
+      }
 
       return res.status(201).json({
-        message: 'Cadastro realizado com sucesso! Enviamos um e-mail para confirmação.',
+        message: 'Cadastro iniciado com sucesso! Enviamos um e-mail para confirmação.',
         client_id,
         user_id
       });
@@ -130,7 +165,13 @@ app.post('/onboarding', async (req, res) => {
       }])
       .select()
       .single();
-    if (companyError) return res.status(400).json({ error: companyError.message });
+    if (companyError) {
+      // rollback total
+      try { await supabase.auth.admin.deleteUser(authUserId); } catch (_) {}
+      try { await supabase.from('users').delete().eq('id', user_id); } catch (_) {}
+      try { await supabase.from('clients').delete().eq('id', client_id); } catch (_) {}
+      return res.status(400).json({ error: companyError.message });
+    }
 
     const { data: contactData, error: contactError } = await supabase
       .from('contacts')
@@ -143,15 +184,30 @@ app.post('/onboarding', async (req, res) => {
       }])
       .select()
       .single();
-    if (contactError) return res.status(400).json({ error: contactError.message });
+    if (contactError) {
+      // rollback total
+      try { await supabase.from('companies').delete().eq('id', companyData?.id); } catch (_) {}
+      try { await supabase.auth.admin.deleteUser(authUserId); } catch (_) {}
+      try { await supabase.from('users').delete().eq('id', user_id); } catch (_) {}
+      try { await supabase.from('clients').delete().eq('id', client_id); } catch (_) {}
+      return res.status(400).json({ error: contactError.message });
+    }
 
     const { error: linkError } = await supabase
       .from('contact_company')
       .insert([{ contact_id: contactData.id, company_id: companyData.id }]);
-    if (linkError) return res.status(400).json({ error: linkError.message });
+    if (linkError) {
+      // rollback total
+      try { await supabase.from('contacts').delete().eq('id', contactData.id); } catch (_) {}
+      try { await supabase.from('companies').delete().eq('id', companyData.id); } catch (_) {}
+      try { await supabase.auth.admin.deleteUser(authUserId); } catch (_) {}
+      try { await supabase.from('users').delete().eq('id', user_id); } catch (_) {}
+      try { await supabase.from('clients').delete().eq('id', client_id); } catch (_) {}
+      return res.status(400).json({ error: linkError.message });
+    }
 
     return res.status(201).json({
-      message: 'Cadastro realizado com sucesso! Enviamos um e-mail para confirmação.',
+      message: 'Cadastro iniciado com sucesso! Enviamos um e-mail para confirmação.',
       client_id,
       user_id,
       company_id: companyData.id,
@@ -160,6 +216,8 @@ app.post('/onboarding', async (req, res) => {
 
   } catch (e) {
     console.error(e);
+    // tentativa de rollback final caso algo tenha escapado
+    // (evite hard-fails aqui porque você pode não ter ids ainda)
     return res.status(500).json({ error: 'Internal server error.' });
   }
 });
